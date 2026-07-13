@@ -7,6 +7,8 @@ Each function mirrors the corresponding torch primitive in
 
 from __future__ import annotations
 
+import math
+
 import mlx.core as mx
 
 
@@ -90,3 +92,112 @@ def tri_mul(
     x = linear(x, p["linear_z.weight"])
     g = sigmoid(linear(zn, p["linear_g.weight"]))
     return x * g
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU + transition (AF3 Alg. 11)
+# ---------------------------------------------------------------------------
+def silu(x: mx.array) -> mx.array:
+    return x * mx.sigmoid(x)
+
+
+def swiglu(x: mx.array, wa: mx.array, wb: mx.array) -> mx.array:
+    return silu(linear(x, wa)) * linear(x, wb)
+
+
+def swiglu_transition(
+    x: mx.array, p: dict, mask: mx.array | None = None, ln_eps: float = 1e-5
+) -> mx.array:
+    """SwiGLUTransition: layer_norm -> swiglu -> linear_out (-> * mask)."""
+    xn = layer_norm(x, p["layer_norm.weight"], p["layer_norm.bias"], ln_eps)
+    h = swiglu(xn, p["swiglu.linear_a.weight"], p["swiglu.linear_b.weight"])
+    out = linear(h, p["linear_out.weight"])
+    if mask is not None:
+        out = out * mask[..., None]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# General gated multi-head attention with additive biases
+# ---------------------------------------------------------------------------
+def mha(
+    q_x: mx.array,
+    kv_x: mx.array,
+    p: dict,
+    no_heads: int,
+    biases: tuple = (),
+    gating: bool = True,
+) -> mx.array:
+    """Matches primitives.Attention: heads = c_hidden per head, q scaled by
+    1/sqrt(c_hidden), additive biases before softmax, optional sigmoid gating."""
+    H = no_heads
+
+    def split(t):
+        t = t.reshape(*t.shape[:-1], H, -1)
+        return mx.swapaxes(t, -2, -3)  # [*, H, N, c_hidden]
+
+    q = split(linear(q_x, p["linear_q.weight"]))
+    k = split(linear(kv_x, p["linear_k.weight"]))
+    v = split(linear(kv_x, p["linear_v.weight"]))
+
+    c_hidden = q.shape[-1]
+    q = q / math.sqrt(c_hidden)
+
+    scores = mx.einsum("...qc,...kc->...qk", q, k)
+    for b in biases:
+        scores = scores + b
+    scores = mx.softmax(scores, axis=-1)
+    o = mx.einsum("...qk,...kc->...qc", scores, v)  # [*, H, Q, c_hidden]
+    o = mx.swapaxes(o, -2, -3)  # [*, Q, H, c_hidden]
+
+    if gating:
+        g = mx.sigmoid(linear(q_x, p["linear_g.weight"]))
+        g = g.reshape(*g.shape[:-1], H, -1)
+        o = o * g
+
+    o = o.reshape(*o.shape[:-2], -1)  # flatten heads
+    return linear(o, p["linear_o.weight"])
+
+
+# ---------------------------------------------------------------------------
+# Triangle attention (AF2 Alg. 13/14) — starting/ending node
+# ---------------------------------------------------------------------------
+def triangle_attention(
+    x: mx.array,
+    p: dict,
+    no_heads: int,
+    starting: bool = True,
+    mask: mx.array | None = None,
+    inf: float = 1e9,
+    ln_eps: float = 1e-5,
+) -> mx.array:
+    """x: [*, I, J, C]. Ending node transposes I<->J first and back after.
+
+    biases = [ mask_bias  = inf*(mask-1)[..., :, None, None, :],
+               tri_bias   = permute(linear_z(x), (2,0,1)).unsqueeze(-4) ]
+    then self-attention over the last-but-one axis via `mha`.
+    """
+    if not starting:
+        x = mx.swapaxes(x, -2, -3)
+        if mask is not None:
+            mask = mx.swapaxes(mask, -1, -2)
+
+    xn = layer_norm(x, p["layer_norm.weight"], p["layer_norm.bias"], ln_eps)
+
+    biases = []
+    if mask is not None:
+        mask_bias = (inf * (mask - 1))[..., :, None, None, :]
+        biases.append(mask_bias)
+
+    tri = linear(xn, p["linear_z.weight"])  # [*, I, J, H]
+    # permute_final_dims (2,0,1): (I, J, H) -> (H, I, J)
+    tri = mx.moveaxis(tri, -1, -3)  # [*, H, I, J]
+    tri = mx.expand_dims(tri, -4)  # unsqueeze(-4)
+    biases.append(tri)
+
+    mha_p = {k[len("mha."):]: v for k, v in p.items() if k.startswith("mha.")}
+    out = mha(xn, xn, mha_p, no_heads, biases=tuple(biases))
+
+    if not starting:
+        out = mx.swapaxes(out, -2, -3)
+    return out
