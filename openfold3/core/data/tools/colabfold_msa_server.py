@@ -108,6 +108,13 @@ def query_colabfold_msa_server(
             is True, also returns a list of template paths for each sequence.
     """
 
+    # Normalize host_url: callers may pass a pydantic Url (e.g.
+    # MsaComputationSettings.server_url), which stringifies WITH a trailing slash
+    # ("https://api.colabfold.com/"). Combined with f"{host_url}/{endpoint}" that
+    # yields a double slash ("https://api.colabfold.com//ticket/msa"), which the API
+    # rejects with HTTP 400 "invalid ID". Coerce to str and strip trailing slashes.
+    host_url = str(host_url).rstrip("/")
+
     submission_endpoint = "ticket/pair" if use_pairing else "ticket/msa"
 
     headers = {}
@@ -268,20 +275,25 @@ def query_colabfold_msa_server(
             while REDO:
                 pbar.set_description("SUBMIT")
 
-                # Resubmit job until it goes through
+                # Resubmit job until it goes through. "ERROR" here is frequently a
+                # transient non-JSON reply from the public API (e.g. "invalid ID")
+                # rather than a genuinely bad sequence, so retry it with backoff up to
+                # a bounded number of attempts instead of aborting the whole job.
                 out = submit(seqs_unique, mode, N)
-                while out["status"] in ["UNKNOWN", "RATELIMIT"]:
+                submit_error_count = 0
+                while out["status"] in ["UNKNOWN", "RATELIMIT", "ERROR"]:
+                    if out["status"] == "ERROR":
+                        submit_error_count += 1
+                        if submit_error_count > 10:
+                            raise Exception(
+                                "MMseqs2 API is giving errors."
+                                "Please confirm your input is a valid protein sequence."
+                                "If error persists, please try again an hour later."
+                            )
                     sleep_time = 5 + random.randint(0, 5)
                     logger.info(f"Sleeping for {sleep_time}s. Reason: {out['status']}")
                     time.sleep(sleep_time)
                     out = submit(seqs_unique, mode, N)
-
-                if out["status"] == "ERROR":
-                    raise Exception(
-                        "MMseqs2 API is giving errors."
-                        "Please confirm your input is a valid protein sequence."
-                        "If error persists, please try again an hour later."
-                    )
 
                 if out["status"] == "MAINTENANCE":
                     raise Exception(
@@ -1079,7 +1091,7 @@ def augment_main_msa_with_query_sequence(
                 else:
                     npz_file = Path(f"{dummy_rep_dir}.npz")
                     npz_file.parent.mkdir(exist_ok=True, parents=True)
-                    msas_preparsed = {"dummy": parse_a3m(dummy_aln).to_dict()}
+                    msas_preparsed = {"colabfold_main": parse_a3m(dummy_aln).to_dict()}
                     np.savez_compressed(npz_file, **msas_preparsed)
                     chain.main_msa_file_paths = [npz_file]
 
