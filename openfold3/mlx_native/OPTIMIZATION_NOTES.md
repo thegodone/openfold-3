@@ -80,3 +80,30 @@ Why it wins on NVIDIA but not Apple:
 Conclusion: the cuEquivariance strategy is a tensor-core/launch-overhead play with
 little headroom on Apple silicon. mx.compile (1.27x) is the win; a hand-tiled
 fused GEMM+epilogue is weeks of work for a single-digit % ceiling here.
+
+## Addendum 2: read the ACTUAL cuEquivariance source (JAX/Triton)
+
+github.com/NVIDIA/cuEquivariance ships open Triton kernels (JAX pkg,
+cuequivariance_jax/triangle/). triangle_multiplicative_update composes:
+  x  = layer_norm_transpose(x, norm_in ...)          # fused LN + transpose
+  ab = sigmoid_gated_dual_gemm(x, p_in, g_in)        # 2 GEMMs + sigmoid(gate)*val epilogue, fused
+  a,b = ab
+  x  = jnp.einsum("dbik,dbjk->dbij", a, b)           # PLAIN einsum -> cuBLAS (NOT kerneled)
+  x  = layer_norm_transpose(x, norm_out ...)
+  x  = sigmoid_gated_dual_gemm_dual_x(x, p_out,g_out)
+So cuEquivariance fuses exactly: (1) LN+transpose, (2) GEMM sigmoid-gate epilogue.
+The O(N^3) contraction is left to the vendor GEMM.
+
+Measured whether mx.compile already captures these (N=256, c=128, M=65536):
+  1 gemm                         0.432 ms
+  2 gemms, no epilogue (floor)   0.950 ms
+  epilogue only (elementwise)    0.686 ms   <- cost of NOT fusing (re-reads DRAM)
+  dual gemm+epilogue eager       1.121 ms
+  dual gemm+epilogue COMPILED    0.961 ms   <- == 2-gemm floor; epilogue is ~free
+
+=> mx.compile ALREADY fuses the sigmoid-gate epilogue onto the GEMM output (no
+DRAM round-trip). Compiled dual-GEMM sits on the 2-GEMM floor. LN+transpose:
+mx.fast.layer_norm + lazy transpose views (cheap). Contraction: vendor GEMM both
+sides. Every cuEquivariance fusion is already captured on Apple silicon; there is
+no headroom left. Fusing the 2 projection GEMMs into 1 (concat) was tested
+separately: no gain (MLX not launch-bound). Final: mx.compile is the win, full stop.
