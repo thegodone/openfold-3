@@ -136,9 +136,9 @@ def mha(
         t = t.reshape(*t.shape[:-1], H, -1)
         return mx.swapaxes(t, -2, -3)  # [*, H, N, c_hidden]
 
-    q = split(linear(q_x, p["linear_q.weight"]))
-    k = split(linear(kv_x, p["linear_k.weight"]))
-    v = split(linear(kv_x, p["linear_v.weight"]))
+    q = split(linear(q_x, p["linear_q.weight"], p.get("linear_q.bias")))
+    k = split(linear(kv_x, p["linear_k.weight"], p.get("linear_k.bias")))
+    v = split(linear(kv_x, p["linear_v.weight"], p.get("linear_v.bias")))
 
     c_hidden = q.shape[-1]
     q = q / math.sqrt(c_hidden)
@@ -151,12 +151,12 @@ def mha(
     o = mx.swapaxes(o, -2, -3)  # [*, Q, H, c_hidden]
 
     if gating:
-        g = mx.sigmoid(linear(q_x, p["linear_g.weight"]))
+        g = mx.sigmoid(linear(q_x, p["linear_g.weight"], p.get("linear_g.bias")))
         g = g.reshape(*g.shape[:-1], H, -1)
         o = o * g
 
     o = o.reshape(*o.shape[:-2], -1)  # flatten heads
-    return linear(o, p["linear_o.weight"])
+    return linear(o, p["linear_o.weight"], p.get("linear_o.bias"))
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +195,105 @@ def triangle_attention(
     tri = mx.expand_dims(tri, -4)  # unsqueeze(-4)
     biases.append(tri)
 
-    mha_p = {k[len("mha."):]: v for k, v in p.items() if k.startswith("mha.")}
+    mha_p = _sub(p, "mha")
     out = mha(xn, xn, mha_p, no_heads, biases=tuple(biases))
 
     if not starting:
         out = mx.swapaxes(out, -2, -3)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Pairformer block (AF3 Alg. 17) and stack
+# ---------------------------------------------------------------------------
+def _sub(p: dict, prefix: str) -> dict:
+    prefix = prefix + "."
+    return {k[len(prefix):]: v for k, v in p.items() if k.startswith(prefix)}
+
+
+def attention_pair_bias(
+    a: mx.array,
+    z: mx.array,
+    p: dict,
+    no_heads: int,
+    mask: mx.array | None = None,
+    inf: float = 1e9,
+    ln_eps: float = 1e-5,
+) -> mx.array:
+    """AttentionPairBias (non-AdaLN): gated MHA over the single rep, biased by
+    the pair rep. Returns the update (added to `a` by the caller)."""
+    an = layer_norm(a, p["layer_norm_a.weight"], p["layer_norm_a.bias"], ln_eps)
+
+    biases = []
+    if mask is not None:
+        biases.append((inf * (mask - 1))[..., None, None, :])
+
+    zb = layer_norm(z, p["layer_norm_z.weight"], p["layer_norm_z.bias"], ln_eps)
+    zb = linear(zb, p["linear_z.weight"])       # [*, N, N, H]
+    zb = mx.moveaxis(zb, -1, -3)                 # permute_final_dims (2,0,1) -> [*, H, N, N]
+    biases.append(zb)
+
+    return mha(an, an, _sub(p, "mha"), no_heads, biases=tuple(biases), gating=True)
+
+
+def pair_block(
+    z: mx.array,
+    p: dict,
+    pair_mask: mx.array,
+    no_heads_pair: int,
+    inf: float = 1e9,
+    ln_eps: float = 1e-5,
+) -> mx.array:
+    """PairBlock (pair_stack): tri-mul out/in, tri-att start/end, pair transition.
+    Both tri-att layers are starting-node; the ending update transposes z externally."""
+    z = z + tri_mul(z, _sub(p, "tri_mul_out"), outgoing=True, mask=pair_mask, ln_eps=ln_eps)
+    z = z + tri_mul(z, _sub(p, "tri_mul_in"), outgoing=False, mask=pair_mask, ln_eps=ln_eps)
+
+    z = z + triangle_attention(
+        z, _sub(p, "tri_att_start"), no_heads_pair, starting=True,
+        mask=pair_mask, inf=inf, ln_eps=ln_eps,
+    )
+
+    zt = mx.swapaxes(z, -2, -3)
+    zt = zt + triangle_attention(
+        zt, _sub(p, "tri_att_end"), no_heads_pair, starting=True,
+        mask=mx.swapaxes(pair_mask, -1, -2), inf=inf, ln_eps=ln_eps,
+    )
+    z = mx.swapaxes(zt, -2, -3)
+
+    z = z + swiglu_transition(z, _sub(p, "pair_transition"), mask=pair_mask, ln_eps=ln_eps)
+    return z
+
+
+def pairformer_block(
+    s: mx.array,
+    z: mx.array,
+    p: dict,
+    single_mask: mx.array,
+    pair_mask: mx.array,
+    no_heads_pair_bias: int = 16,
+    no_heads_pair: int = 4,
+    inf: float = 1e9,
+    ln_eps: float = 1e-5,
+) -> tuple[mx.array, mx.array]:
+    z = pair_block(z, _sub(p, "pair_stack"), pair_mask, no_heads_pair, inf, ln_eps)
+    s = s + attention_pair_bias(
+        s, z, _sub(p, "attn_pair_bias"), no_heads_pair_bias,
+        mask=single_mask, inf=inf, ln_eps=ln_eps,
+    )
+    s = s + swiglu_transition(s, _sub(p, "single_transition"), mask=single_mask, ln_eps=ln_eps)
+    return s, z
+
+
+def pairformer_stack(
+    s: mx.array,
+    z: mx.array,
+    p: dict,
+    single_mask: mx.array,
+    pair_mask: mx.array,
+    n_blocks: int,
+    **kw,
+) -> tuple[mx.array, mx.array]:
+    for i in range(n_blocks):
+        s, z = pairformer_block(s, z, _sub(p, f"blocks.{i}"), single_mask, pair_mask, **kw)
+    return s, z
