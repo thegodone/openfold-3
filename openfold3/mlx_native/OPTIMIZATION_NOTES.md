@@ -48,3 +48,35 @@ threadgroup memory could reduce. That is a large, uncertain-payoff project.
 - The two remaining levers are (a) a careful mixed-precision bf16 pass validated
   on real structures, and (b) a hand-tiled fused triangle Metal kernel. Both are
   real projects, not quick wins.
+
+## Addendum: kernel-level analysis of the cuEquivariance approach
+
+cuEquivariance's `triangle_multiplicative_update` requires `hidden_dim % 32 == 0`
+=> it tiles over channel-blocks of 32 (warp width), fusing LN + gated projections
++ the O(N^3) contraction + output, keeping tiles in shared memory to avoid
+materializing the N^2 x c intermediates.
+
+Tested whether this can transfer to Metal/MLX:
+
+1. Custom Metal contraction kernel (mx.fast.metal_kernel, correct, maxdiff 0):
+     N=128  0.42x   N=256  0.13x   N=384  0.05x   vs MLX's batched GEMM.
+   The contraction IS a GEMM; MLX runs it on simdgroup_matrix. A naive custom
+   kernel is 2-20x slower. To win you must reimplement a tiled simdgroup_matrix
+   GEMM and fuse the epilogue.
+
+2. Bandwidth ceiling on fusion (N=256, c=128): the a,b intermediates are 33.5 MB
+   each; fusing projection->contraction saves ~134 MB round-trip. At ~400 GB/s
+   that's ~0.33 ms on a ~5 ms op => ~6% ceiling, and only if the fused GEMM
+   matches MLX's tuned one.
+
+Why it wins on NVIDIA but not Apple:
+- Tensor cores make the GEMM fast enough that DRAM/launch overhead dominates ->
+  fusion pays. Apple has no exposed tensor-core GEMM at this level, so the work
+  is GEMM-bound, not overhead-bound.
+- CUDA per-op launch overhead is higher; MLX already batches dispatch.
+- Warp register files + 48-228 KB shared mem vs Apple's 32 KB threadgroup mem ->
+  smaller tiles, smaller fusion benefit.
+
+Conclusion: the cuEquivariance strategy is a tensor-core/launch-overhead play with
+little headroom on Apple silicon. mx.compile (1.27x) is the win; a hand-tiled
+fused GEMM+epilogue is weeks of work for a single-digit % ceiling here.
