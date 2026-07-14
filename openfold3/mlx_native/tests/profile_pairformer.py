@@ -64,6 +64,22 @@ def main():
             return s, z
 
         results["torch-mps"] = timeit(run_torch, torch.mps.synchronize)
+
+        # torch.compile on MPS (Inductor). May graph-break or fall back; report
+        # whatever it actually does after warmup.
+        try:
+            def torch_stack(s, z):
+                for b in blocks:
+                    s, z = b(s, z, smm, pmm, inplace_safe=False)
+                return s, z
+
+            compiled = torch.compile(torch_stack, backend="inductor", dynamic=False)
+            with torch.no_grad():
+                results["torch-mps-compiled"] = timeit(
+                    lambda: compiled(s_d, z_d), torch.mps.synchronize, warmup=3
+                )
+        except Exception as e:
+            print(f"torch.compile failed: {type(e).__name__}: {str(e)[:200]}")
         del blocks
     else:
         print("MPS not available")
