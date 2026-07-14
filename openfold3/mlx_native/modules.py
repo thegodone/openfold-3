@@ -11,6 +11,10 @@ import math
 
 import mlx.core as mx
 
+# Toggle fused Metal kernels (mx.fast.layer_norm / scaled_dot_product_attention).
+# These are hand-written kernels that mx.compile cannot synthesize.
+USE_FAST = False
+
 
 # ---------------------------------------------------------------------------
 # Elementary primitives
@@ -30,6 +34,8 @@ def layer_norm(
     eps: float = 1e-5,
 ) -> mx.array:
     """LayerNorm over the last dim, matching torch ``F.layer_norm`` semantics."""
+    if USE_FAST:
+        return mx.fast.layer_norm(x, weight, bias, eps)
     mu = mx.mean(x, axis=-1, keepdims=True)
     var = mx.var(x, axis=-1, keepdims=True)
     y = (x - mu) * mx.rsqrt(var + eps)
@@ -141,14 +147,32 @@ def mha(
     v = split(linear(kv_x, p["linear_v.weight"], p.get("linear_v.bias")))
 
     c_hidden = q.shape[-1]
-    q = q / math.sqrt(c_hidden)
+    scale = 1.0 / math.sqrt(c_hidden)
 
-    scores = mx.einsum("...qc,...kc->...qk", q, k)
-    for b in biases:
-        scores = scores + b
-    scores = mx.softmax(scores, axis=-1)
-    o = mx.einsum("...qk,...kc->...qc", scores, v)  # [*, H, Q, c_hidden]
-    o = mx.swapaxes(o, -2, -3)  # [*, Q, H, c_hidden]
+    if USE_FAST:
+        mask = None
+        if biases:
+            mask = biases[0]
+            for b in biases[1:]:
+                mask = mask + b
+        # mx.fast.scaled_dot_product_attention wants 4D [B, H, L, D].
+        squeeze = q.ndim == 3
+        if squeeze:
+            q, k, v = q[None], k[None], v[None]
+            if mask is not None:
+                mask = mask[None]
+        o = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        if squeeze:
+            o = o[0]
+        o = mx.swapaxes(o, -2, -3)  # [*, Q, H, c_hidden]
+    else:
+        q = q * scale
+        scores = mx.einsum("...qc,...kc->...qk", q, k)
+        for b in biases:
+            scores = scores + b
+        scores = mx.softmax(scores, axis=-1)
+        o = mx.einsum("...qk,...kc->...qc", scores, v)  # [*, H, Q, c_hidden]
+        o = mx.swapaxes(o, -2, -3)  # [*, Q, H, c_hidden]
 
     if gating:
         g = mx.sigmoid(linear(q_x, p["linear_g.weight"], p.get("linear_g.bias")))
